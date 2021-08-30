@@ -1,13 +1,14 @@
 import {fixUrl, getAbsoluteBaseURL} from '../global/url';
-import Listeners from '../global/listeners';
-import HTTP from '../http/http';
+import Listeners, {Handler} from '../global/listeners';
+import HTTP, {HTTPAuth, RequestParams} from '../http/http';
 import promiseWithTimeout from '../global/promise-with-timeout';
+import AuthDialogService from '../auth-dialog-service/auth-dialog-service';
 
-import AuthStorage from './storage';
-import AuthResponseParser from './response-parser';
+import AuthStorage, {AuthMessage, StoredAuthState} from './storage';
+import AuthResponseParser, {AuthError} from './response-parser';
 import AuthRequestBuilder from './request-builder';
 import BackgroundFlow from './background-flow';
-import TokenValidator from './token-validator';
+import TokenValidator, {TokenValidationError, TokenValidatorConfig} from './token-validator';
 
 /* eslint-disable no-magic-numbers */
 export const DEFAULT_EXPIRES_TIMEOUT = 40 * 60;
@@ -24,7 +25,78 @@ export const USER_CHANGE_POSTPONED_EVENT = 'changePostponed';
 
 function noop() {}
 
-const DEFAULT_CONFIG = {
+export interface AuthUser {
+  guest?: boolean
+  id?: string
+  name?: string
+  login?: string
+  profile?: {
+    avatar?: {
+      url?: string
+    }
+  }
+}
+
+export interface AuthTranslations {
+  login: string
+  loginTo: string
+  cancel: string
+  postpone: string
+  youHaveLoggedInAs: string
+  applyChange: string
+  backendIsNotAvailable: string
+  checkAgain: string
+  nothingHappensLink: string
+  errorMessage: string
+}
+
+export interface LoginFlow {
+  stop(): void
+  authorize(): Promise<unknown>
+}
+
+export interface LoginFlowClass {
+  new (
+    requestBuilder: AuthRequestBuilder,
+    storage: AuthStorage,
+    translations: AuthTranslations,
+  ): LoginFlow
+}
+
+export interface BackendDownParams {
+  onCheckAgain(): Promise<void>
+  onPostpone(): void
+  backendError: Error
+  translations: AuthTranslations
+}
+
+export interface AuthConfig extends TokenValidatorConfig {
+  serverUri: string
+  redirectUri: string
+  requestCredentials: string
+  clientId: string
+  redirect: boolean
+  cleanHash: boolean
+  userFields: readonly string[]
+  fetchCredentials?: RequestCredentials | null | undefined
+  cacheCurrentUser: boolean
+  reloadOnUserChange: boolean
+  embeddedLogin: boolean
+  EmbeddedLoginFlow?: LoginFlowClass | null | undefined
+  backgroundRefreshTimeout?: number | null | undefined
+  onLogout?: (() => void) | null | undefined
+  onPostponeChangedUser: (prevUser: AuthUser | null, nextUser: AuthUser | null) => void
+  onPostponeLogout: () => void
+  enableBackendStatusCheck: boolean
+  backendCheckTimeout: number
+  checkBackendIsUp: () => Promise<unknown>
+  onBackendDown: (params: BackendDownParams) => () => void
+  defaultExpiresIn: number
+  translations: AuthTranslations
+  userParams?: RequestParams | undefined
+}
+
+const DEFAULT_CONFIG: Omit<AuthConfig, 'serverUri'> = {
   cacheCurrentUser: false,
   reloadOnUserChange: true,
   embeddedLogin: false,
@@ -43,7 +115,7 @@ const DEFAULT_CONFIG = {
   enableBackendStatusCheck: true,
   backendCheckTimeout: DEFAULT_BACKEND_CHECK_TIMEOUT,
   checkBackendIsUp: () => Promise.resolve(null),
-  onBackendDown: () => {},
+  onBackendDown: () => () => {},
 
   defaultExpiresIn: DEFAULT_EXPIRES_TIMEOUT,
   translations: {
@@ -60,7 +132,31 @@ const DEFAULT_CONFIG = {
   }
 };
 
-export default class Auth {
+type AuthPayloadMap = {
+  userChange: [AuthUser | undefined, void]
+  logout: [void, void]
+  logoutPostponed: [void, void]
+  changePostponed: [void, void]
+}
+
+export interface AuthService {
+  serviceName: string
+  serviceImage: string
+}
+
+interface Deferred<T> {
+  promise?: Promise<T>
+  resolve?: (value: T) => void
+  reject?: (reason: unknown) => void
+}
+
+interface AuthDialogParams {
+  nonInteractive?: boolean
+  error?: Error
+  canCancel?: boolean
+}
+
+export default class Auth implements HTTPAuth {
   static DEFAULT_CONFIG = DEFAULT_CONFIG;
   static API_PATH = 'api/rest/';
   static API_AUTH_PATH = 'oauth2/auth';
@@ -70,21 +166,25 @@ export default class Auth {
   static shouldRefreshToken = TokenValidator.shouldRefreshToken;
   static storageIsUnavailable = !navigator.cookieEnabled;
 
-  config = {};
-  listeners = new Listeners();
-  http = null;
-  _service = {};
-  _storage = null;
-  _responseParser = new AuthResponseParser();
-  _requestBuilder = null;
-  _backgroundFlow = null;
-  _embeddedFlow = null;
-  _tokenValidator = null;
-  _postponed = false;
-  _backendCheckPromise = null;
-  _authDialogService = undefined;
+  config: AuthConfig;
+  listeners = new Listeners<AuthPayloadMap>();
+  http: HTTP | null = null;
+  private _service: Partial<AuthService> = {};
+  private _storage: AuthStorage | null = null;
+  private _responseParser = new AuthResponseParser();
+  private _requestBuilder: AuthRequestBuilder | null = null;
+  private _backgroundFlow: BackgroundFlow | null;
+  private _embeddedFlow: LoginFlow | null = null;
+  private _tokenValidator: TokenValidator | null = null;
+  private _postponed = false;
+  private _backendCheckPromise: Promise<void> | null = null;
+  private _authDialogService: typeof AuthDialogService | undefined = undefined;
+  private _domainStorage: AuthStorage;
+  user: AuthUser | null = null;
+  private _initDeferred?: Deferred<string | void>;
+  private _isLoginWindowOpen?: boolean;
 
-  constructor(config) {
+  constructor(config: Partial<AuthConfig> & Pick<AuthConfig, 'serverUri'>) {
     if (!config) {
       throw new Error('Config is required');
     }
@@ -161,7 +261,7 @@ export default class Auth {
       : undefined;
     this.http = new HTTP(this, API_BASE, fetchConfig);
 
-    const getUser = async token => {
+    const getUser = async (token: string) => {
       const user = await this.getUser(token);
       this.user = user;
       return user;
@@ -173,17 +273,17 @@ export default class Auth {
       this.addListener(LOGOUT_EVENT, this.config.onLogout);
     }
 
-    if (this.config.reloadOnUserChange === true) {
+    if (this.config.reloadOnUserChange) {
       this.addListener(USER_CHANGED_EVENT, () => this._reloadCurrentPage());
     }
 
     this.addListener(LOGOUT_POSTPONED_EVENT, () => this._setPostponed(true));
     this.addListener(USER_CHANGE_POSTPONED_EVENT, () => this._setPostponed(true));
     this.addListener(USER_CHANGED_EVENT, () => this._setPostponed(false));
-    this.addListener(USER_CHANGED_EVENT, user => user && this._updateDomainUser(user.id));
+    this.addListener(USER_CHANGED_EVENT, (user: AuthUser | null | undefined) => {user && this._updateDomainUser(user.id)});
     if (this.config.cacheCurrentUser) {
-      this.addListener(LOGOUT_EVENT, () => this._storage.wipeCachedCurrentUser());
-      this.addListener(USER_CHANGED_EVENT, () => this._storage.onUserChanged());
+      this.addListener(LOGOUT_EVENT, () => this._storage?.wipeCachedCurrentUser());
+      this.addListener(USER_CHANGED_EVENT, () => this._storage?.onUserChanged());
     }
 
     this._createInitDeferred();
@@ -191,39 +291,40 @@ export default class Auth {
     this.setUpPreconnect(config.serverUri);
   }
 
-  _setPostponed(postponed = false) {
+  private _setPostponed(postponed = false) {
     this._postponed = postponed;
   }
 
-  _updateDomainUser(userID) {
+  private _updateDomainUser(userID: string | undefined) {
     this._domainStorage.sendMessage(DOMAIN_USER_CHANGED_EVENT, {
       userID,
       serviceID: this.config.clientId
     });
   }
 
-  addListener(event, handler) {
+  addListener<E extends keyof AuthPayloadMap>(event: E, handler: Handler<AuthPayloadMap, E>) {
     this.listeners.add(event, handler);
   }
 
-  removeListener(event, handler) {
+  removeListener<E extends keyof AuthPayloadMap>(event: E, handler: Handler<AuthPayloadMap, E>) {
     this.listeners.remove(event, handler);
   }
 
-  setAuthDialogService(authDialogService) {
+  setAuthDialogService(authDialogService: typeof AuthDialogService) {
     this._authDialogService = authDialogService;
   }
 
-  setCurrentService(service) {
+  setCurrentService(service: AuthService) {
     this._service = service;
   }
 
-  _createInitDeferred() {
-    this._initDeferred = {};
-    this._initDeferred.promise = new Promise((resolve, reject) => {
-      this._initDeferred.resolve = resolve;
-      this._initDeferred.reject = reject;
+  private _createInitDeferred() {
+    const deferred: Deferred<string | void> = {};
+    deferred.promise = new Promise((resolve, reject) => {
+      deferred.resolve = resolve;
+      deferred.reject = reject;
     });
+    this._initDeferred = deferred;
   }
 
   /**
@@ -231,7 +332,7 @@ export default class Auth {
    * that should be restored after returning back from auth server.
    */
   async init() {
-    this._storage.onTokenChange(async token => {
+    this._storage?.onTokenChange(async token => {
       const isGuest = this.user ? this.user.guest : false;
 
       if (isGuest && !token) {
@@ -251,7 +352,8 @@ export default class Auth {
       }
     });
 
-    this._domainStorage.onMessage(DOMAIN_USER_CHANGED_EVENT, ({userID, serviceID}) => {
+    this._domainStorage.onMessage(DOMAIN_USER_CHANGED_EVENT, (message: AuthMessage | null) => {
+      const {userID, serviceID} = message || {};
       if (serviceID === this.config.clientId) {
         return;
       }
@@ -277,14 +379,14 @@ export default class Auth {
 
     try {
       // Check if there is a valid token
-      await this._tokenValidator.validateToken();
+      await this._tokenValidator?.validateToken();
 
 
       // Checking if there is a message left by another app on this domain
       const message = await this._domainStorage._messagesStorage.get(`domain-message-${DOMAIN_USER_CHANGED_EVENT}`);
       if (message) {
         const {userID, serviceID} = message;
-        if (serviceID !== this.config.clientId && (!userID || this.user.id !== userID)) {
+        if (serviceID !== this.config.clientId && (!userID || this.user?.id !== userID)) {
           this.forceTokenUpdate();
         }
       }
@@ -295,11 +397,11 @@ export default class Auth {
         // Check if we have requested to restore state anyway
         state = await this._checkForStateRestoration();
       }
-      this._initDeferred.resolve(state && state.restoreLocation);
+      this._initDeferred?.resolve?.(state && state.restoreLocation);
       return state?.restoreLocation;
     } catch (error) {
       if (Auth.storageIsUnavailable) {
-        this._initDeferred.resolve(); // No way to handle if cookies are disabled
+        this._initDeferred?.resolve?.(); // No way to handle if cookies are disabled
         await this.requestUser(); // Someone may expect user to be loaded as a part of token validation
         return null;
       }
@@ -307,21 +409,21 @@ export default class Auth {
     }
   }
 
-  async sendRedirect(error) {
-    const authRequest = await this._requestBuilder.prepareAuthRequest();
-    this._redirectCurrentPage(authRequest.url);
+  async sendRedirect(error: Error) {
+    const authRequest = await this._requestBuilder?.prepareAuthRequest();
+    this._redirectCurrentPage(authRequest?.url);
 
     throw error;
   }
 
-  async handleInitError(error) {
-    if (error.stateId) {
+  async handleInitError(error: Error | AuthError) {
+    if ('stateId' in error && error.stateId) {
       try {
-        const state = await this._storage.getState(error.stateId);
+        const state = await this._storage?.getState(error.stateId);
 
         if (state && state.nonRedirect) {
           state.error = error;
-          this._storage.saveState(error.stateId, state);
+          this._storage?.saveState(error.stateId, state);
 
           // Return endless promise in the background to avoid service start
           return new Promise(noop);
@@ -334,18 +436,18 @@ export default class Auth {
     throw error;
   }
 
-  async handleInitValidationError(error) {
+  async handleInitValidationError(error: Error | TokenValidationError) {
     // Redirect flow
-    if (error.authRedirect && this.config.redirect) {
+    if ('authRedirect' in error && error.authRedirect && this.config.redirect) {
       return this.sendRedirect(error);
     }
 
     // Background flow
-    if (error.authRedirect && !this.config.redirect) {
+    if ('authRedirect' in error && error.authRedirect && !this.config.redirect) {
       try {
-        await this._backgroundFlow.authorize();
-        await this._tokenValidator.validateToken();
-        this._initDeferred.resolve();
+        await this._backgroundFlow?.authorize();
+        await this._tokenValidator?.validateToken();
+        this._initDeferred?.resolve?.();
         return undefined;
       } catch (validationError) {
         // Fallback to redirect flow
@@ -353,7 +455,7 @@ export default class Auth {
       }
     }
 
-    this._initDeferred.reject(error);
+    this._initDeferred?.reject?.(error);
     throw error;
   }
 
@@ -362,18 +464,18 @@ export default class Auth {
    * Can redirect to login page.
    * @return {Promise.<string>}
    */
-  async requestToken() {
+  async requestToken(): Promise<string | null> {
     if (this._postponed) {
       throw new Error('You should log in to be able to make requests');
     }
 
     try {
-      await this._initDeferred.promise;
+      await this._initDeferred?.promise;
 
       if (Auth.storageIsUnavailable) {
         return null; // Forever guest if storage is unavailable
       }
-      return await this._tokenValidator.validateTokenLocally();
+      return await this._tokenValidator?.validateTokenLocally() ?? null;
     } catch (e) {
       return this.forceTokenUpdate();
     }
@@ -383,7 +485,7 @@ export default class Auth {
    * Get new token in the background or redirect to the login page.
    * @return {Promise.<string>}
    */
-  async forceTokenUpdate() {
+  async forceTokenUpdate(): Promise<string | null> {
     try {
       if (!this._backendCheckPromise) {
         this._backendCheckPromise = this._checkBackendsStatusesIfEnabled();
@@ -396,14 +498,15 @@ export default class Auth {
     }
 
     try {
-      return await this._backgroundFlow.authorize();
+      return await this._backgroundFlow?.authorize() ?? null;
     } catch (error) {
 
       if (this._canShowDialogs()) {
-        return this._showAuthDialog({nonInteractive: true, error});
+        this._showAuthDialog({nonInteractive: true, error});
+        return null;
       } else {
-        const authRequest = await this._requestBuilder.prepareAuthRequest();
-        this._redirectCurrentPage(authRequest.url);
+        const authRequest = await this._requestBuilder?.prepareAuthRequest();
+        this._redirectCurrentPage(authRequest?.url);
       }
 
       throw new TokenValidator.TokenValidationError(error.message);
@@ -415,7 +518,7 @@ export default class Auth {
       return;
     }
     try {
-      const {serviceName, iconUrl: serviceImage} = await this.http.get(`oauth2/interactive/login/settings?client_id=${this.config.clientId}`) || {};
+      const {serviceName, iconUrl: serviceImage} = await this.http?.get(`oauth2/interactive/login/settings?client_id=${this.config.clientId}`) || {};
       this.setCurrentService({serviceImage, serviceName});
     } catch (e) {
       // noop
@@ -429,13 +532,13 @@ export default class Auth {
   /**
    * @return {Promise.<object>}
    */
-  getUser(accessToken) {
+  getUser(accessToken: string | null) {
     if (this.config.cacheCurrentUser) {
-      return this._storage.getCachedUser(
-        () => this.http.authorizedFetch(Auth.API_PROFILE_PATH, accessToken, this.config.userParams)
+      return this._storage?.getCachedUser(
+        async () => (await this.http?.authorizedFetch(Auth.API_PROFILE_PATH, accessToken, this.config.userParams)) ?? null
       );
     } else {
-      return this.http.authorizedFetch(Auth.API_PROFILE_PATH, accessToken, this.config.userParams);
+      return this.http?.authorizedFetch(Auth.API_PROFILE_PATH, accessToken, this.config.userParams);
     }
   }
 
@@ -463,13 +566,13 @@ export default class Auth {
   async updateUser() {
     this._setPostponed(false);
     const accessToken = await this.requestToken();
-    this._storage.wipeCachedCurrentUser();
+    this._storage?.wipeCachedCurrentUser();
     const user = await this.getUser(accessToken);
     this.user = user;
     this.listeners.trigger(USER_CHANGED_EVENT, user);
   }
 
-  async _detectUserChange(accessToken) {
+  private async _detectUserChange(accessToken: string) {
     const windowWasOpen = this._isLoginWindowOpen;
 
     const user = await this.getUser(accessToken);
@@ -500,7 +603,7 @@ export default class Auth {
     }
   }
 
-  _beforeLogout(params) {
+  private _beforeLogout(params: AuthDialogParams) {
     if (this._canShowDialogs()) {
       this._showAuthDialog(params);
       return;
@@ -509,9 +612,9 @@ export default class Auth {
     this.logout();
   }
 
-  _showAuthDialog({nonInteractive, error, canCancel} = {}) {
+  private _showAuthDialog({nonInteractive, error, canCancel}: AuthDialogParams = {}) {
     const {embeddedLogin, onPostponeLogout, translations} = this.config;
-    const cancelable = this.user.guest || canCancel;
+    const cancelable = this.user?.guest || canCancel;
 
     this._createInitDeferred();
 
@@ -524,7 +627,7 @@ export default class Auth {
     };
 
     const onConfirm = () => {
-      if (embeddedLogin !== true) {
+      if (!embeddedLogin) {
         closeDialog();
         this.logout();
         return;
@@ -533,8 +636,8 @@ export default class Auth {
     };
 
     const onCancel = () => {
-      this._embeddedFlow.stop();
-      this._storage.sendMessage(Auth.CLOSE_WINDOW_MESSAGE, Date.now());
+      this._embeddedFlow?.stop();
+      this._storage?.sendMessage(Auth.CLOSE_WINDOW_MESSAGE, Date.now());
       closeDialog();
       if (!cancelable) {
         this._initDeferred.resolve();
@@ -574,7 +677,7 @@ export default class Auth {
     );
   }
 
-  _showUserChangedDialog({newUser, onApply, onPostpone} = {}) {
+  private _showUserChangedDialog({newUser, onApply, onPostpone} = {}) {
     const {translations} = this.config;
 
     this._createInitDeferred();
@@ -603,7 +706,7 @@ export default class Auth {
     });
   }
 
-  _extractErrorMessage(error, logError = false) {
+  private _extractErrorMessage(error: Error | AuthError, logError = false) {
     if (!error) {
       return null;
     }
@@ -626,7 +729,7 @@ export default class Auth {
     return error.toString ? error.toString() : null;
   }
 
-  _showBackendDownDialog(backendError) {
+  private _showBackendDownDialog(backendError) {
     const {onBackendDown, translations} = this.config;
     const REPEAT_TIMEOUT = 5000;
     let timerId = null;
@@ -681,7 +784,7 @@ export default class Auth {
   /**
    * Wipe accessToken and redirect to auth page with required authorization
    */
-  async logout(extraParams) {
+  async logout(extraParams?: Record<string, unknown>) {
     const requestParams = {
       // eslint-disable-next-line camelcase
       request_credentials: 'required',
@@ -689,7 +792,7 @@ export default class Auth {
     };
 
     await this._checkBackendsStatusesIfEnabled();
-    await this.listeners.trigger(LOGOUT_EVENT);
+    await this.listeners.trigger('logout', undefined);
     this._updateDomainUser(null);
     await this._storage.wipeToken();
 
@@ -697,7 +800,7 @@ export default class Auth {
     this._redirectCurrentPage(authRequest.url);
   }
 
-  async _runEmbeddedLogin() {
+  private async _runEmbeddedLogin() {
     this._storage.sendMessage(Auth.CLOSE_WINDOW_MESSAGE, Date.now());
     try {
       this._isLoginWindowOpen = true;
@@ -750,7 +853,7 @@ export default class Auth {
    * @return {Promise} promise that is resolved to restoreLocation URL, or rejected
    * @private
    */
-  async _checkForAuthResponse() {
+  private async _checkForAuthResponse() {
     // getAuthResponseURL may throw an exception
     const authResponse = this._responseParser.getAuthResponseFromURL();
     const {scope: defaultScope, defaultExpiresIn, cleanHash} = this.config;
@@ -764,18 +867,18 @@ export default class Auth {
     }
 
     const {state: stateId, scope, expiresIn, accessToken} = authResponse;
-    const newState = await (stateId && this._storage.getState(stateId)) || {};
+    const newState: Partial<StoredAuthState> = await (stateId && this._storage?.getState(stateId)) || {};
 
     const scopes = scope ? scope.split(' ') : newState.scopes || defaultScope || [];
     const effectiveExpiresIn = expiresIn ? parseInt(expiresIn, 10) : defaultExpiresIn;
     const expires = TokenValidator._epoch() + effectiveExpiresIn;
 
-    await this._storage.saveToken({accessToken, scopes, expires, lifeTime: effectiveExpiresIn});
+    await this._storage?.saveToken({accessToken, scopes, expires, lifeTime: effectiveExpiresIn});
 
     return newState;
   }
 
-  async _checkForStateRestoration() {
+  private async _checkForStateRestoration() {
     const authResponse = this._responseParser._authResponse;
     if (authResponse && this.config.cleanHash) {
       this.setHash('');
@@ -784,7 +887,7 @@ export default class Auth {
     return await (stateId && this._storage.getState(stateId)) || {};
   }
 
-  _checkBackendsAreUp() {
+  private _checkBackendsAreUp() {
     const {backendCheckTimeout} = this.config;
     return Promise.all([
       promiseWithTimeout(
@@ -801,7 +904,7 @@ export default class Auth {
     });
   }
 
-  async _checkBackendsStatusesIfEnabled() {
+  private async _checkBackendsStatusesIfEnabled() {
     if (!this.config.enableBackendStatusCheck) {
       return;
     }
@@ -831,7 +934,7 @@ export default class Auth {
    * @param {string} url
    * @private
    */
-  _redirectCurrentPage(url) {
+  private _redirectCurrentPage(url) {
 
     window.location = fixUrl(url);
   }
@@ -839,11 +942,11 @@ export default class Auth {
   /**
    * Reloads current page
    */
-  _reloadCurrentPage() {
+  private _reloadCurrentPage() {
     this._redirectCurrentPage(window.location.href);
   }
 
-  _canShowDialogs() {
+  private _canShowDialogs() {
     return this.config.embeddedLogin && this._authDialogService;
   }
 
