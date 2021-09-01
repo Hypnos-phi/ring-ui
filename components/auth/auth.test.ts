@@ -1,18 +1,22 @@
 import HTTP from '../http/http';
+import LocalStorage from '../storage/storage__local';
 
 import Auth, {USER_CHANGED_EVENT, LOGOUT_EVENT} from './auth';
 import AuthRequestBuilder from './request-builder';
-import AuthResponseParser from './response-parser';
+import AuthResponseParser, {AuthError} from './response-parser';
 import BackgroundFlow from './background-flow';
 import TokenValidator from './token-validator';
+import {Stub} from "../../test-helpers/globals";
 
-import MockedStorage from 'imports-loader?imports=default|storage-mock|window!../storage/storage__local';
+// eslint-disable-next-line import/no-commonjs
+const MockedStorage: typeof LocalStorage = require('imports-loader?imports=default|storage-mock|window!../storage/storage__local').default;
 
 const HOUR = 3600;
 
 describe('Auth', () => {
   describe('construction', () => {
     it('should require provide config', () => {
+      // @ts-expect-error testing a wrong usage
       (() => new Auth()).should.throw(Error, 'Config is required');
     });
 
@@ -20,6 +24,7 @@ describe('Auth', () => {
       (() => new Auth({
         serverUri: 'value',
         /* eslint-disable camelcase */
+        // @ts-expect-error testing a wrong usage
         redirect_uri: 'value',
         request_credentials: 'value',
         client_id: 'value'
@@ -31,9 +36,11 @@ describe('Auth', () => {
 
     it('should require provide server uri', () => {
       (() => new Auth({
+        // @ts-expect-error testing a wrong usage
         serverUri: null
       })).should.throw(Error, '\"serverUri\" property is required');
 
+      // @ts-expect-error testing a wrong usage
       (() => new Auth({})).
         should.throw(Error, '\"serverUri\" property is required');
     });
@@ -63,11 +70,12 @@ describe('Auth', () => {
       };
       const auth = new Auth(config);
 
-      auth.config.userParams.should.deep.equal({
+      const expectedParams = {
         query: {
           fields: 'guest,id,name,login,profile/avatar/url,profile/email'
         }
-      });
+      };
+      expectedParams.should.deep.equal(auth.config.userParams);
     });
 
     it('should not redirect on object construction', () => {
@@ -113,11 +121,12 @@ describe('Auth', () => {
 
     it('should add preconnect link tag', () => {
       const config = {serverUri: 'http://url-to-preconnect.ru/'};
-      // eslint-disable-next-line no-unused-vars
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const auth = new Auth(config);
 
-      document.querySelector(`[rel=preconnect][href="${config.serverUri}"]`).
-        should.exist;
+      should.exist(
+        document.querySelector(`[rel=preconnect][href="${config.serverUri}"]`)
+      );
     });
   });
 
@@ -136,10 +145,10 @@ describe('Auth', () => {
       sandbox.stub(Auth.prototype, 'setHash');
     });
 
-    afterEach(() => Promise.all([auth._storage.cleanStates(), auth._storage.wipeToken()]));
+    afterEach(() => Promise.all([auth._storage?.cleanStates(), auth._storage?.wipeToken()]));
 
     it('should resolve to undefined if there is a valid token', async () => {
-      await auth._storage.saveToken({
+      await auth._storage?.saveToken({
         accessToken: 'token',
         expires: TokenValidator._epoch() + HOUR,
         scopes: ['0-0-0-0-0']
@@ -162,19 +171,20 @@ describe('Auth', () => {
         scope: ['0-0-0-0-0', 'youtrack'],
         optionalScopes: ['youtrack']
       });
-      await auth._storage.saveState('xyz', {
+      await auth._storage?.saveState('xyz', {
         restoreLocation: 'http://localhost:8080/hub/users',
         scopes: ['0-0-0-0-0']
       });
       const restoreLocation = await auth.init();
-      restoreLocation.should.be.equal('http://localhost:8080/hub/users');
-      const token = await auth._storage.getToken();
-      token.should.be.deep.equal({
+      'http://localhost:8080/hub/users'.should.be.equal(restoreLocation);
+      const token = await auth._storage?.getToken();
+      const expectedToken = {
         accessToken: '2YotnFZFEjr1zCsicMWpAA',
         scopes: ['0-0-0-0-0'],
         expires: frozenTime + HOUR,
         lifeTime: 3600
-      });
+      };
+      expectedToken.should.be.deep.equal(token);
     });
 
     it('should not throw error if user does not have state in local storage', () => {
@@ -298,10 +308,11 @@ describe('Auth', () => {
   });
 
   describe('background init', () => {
-    let auth;
+    let auth: Auth;
+    let _getValidatedToken: Stub<TokenValidator['_getValidatedToken']>;
 
     beforeEach(() => {
-      sandbox.stub(TokenValidator.prototype, '_getValidatedToken').
+      _getValidatedToken = sandbox.stub(TokenValidator.prototype, '_getValidatedToken').
         returns(Promise.reject({authRedirect: true}));
       sandbox.stub(Auth.prototype, '_redirectCurrentPage');
       sandbox.stub(Auth.prototype, 'getUser');
@@ -316,18 +327,22 @@ describe('Auth', () => {
         optionalScopes: ['youtrack']
       });
 
-      auth._storage._tokenStorage = auth._storage._stateStorage =
+      if (auth._storage != null) {
+        auth._storage._tokenStorage = auth._storage._stateStorage =
         auth._storage._messagesStorage = new MockedStorage();
+      }
 
-      auth._domainStorage._messagesStorage = new MockedStorage();
+      if (auth._domainStorage != null) {
+        auth._domainStorage._messagesStorage = new MockedStorage();
+      }
     });
 
     it('should initiate when there is no valid token', async () => {
-      TokenValidator.prototype._getValidatedToken.onCall(1).
+      _getValidatedToken.onCall(1).
         returns(Promise.resolve('token'));
 
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame').callsFake(() => {
-        auth._storage.saveToken({
+        auth._storage?.saveToken({
           accessToken: 'token',
           expires: TokenValidator._epoch() + HOUR,
           scopes: ['0-0-0-0-0']
@@ -351,7 +366,7 @@ describe('Auth', () => {
 
     it('should initiate and fall back to redirect when token check fails', async () => {
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame').callsFake(() => {
-        auth._storage.saveToken({
+        auth._storage?.saveToken({
           accessToken: 'token',
           expires: TokenValidator._epoch() + HOUR,
           scopes: ['0-0-0-0-0']
@@ -384,7 +399,7 @@ describe('Auth', () => {
 
     it('should initiate and fall back to redirect when guest is banned', async () => {
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame').callsFake(() => {
-        auth._storage.saveState('unique', {error: {code: 'access_denied'}});
+        auth._storage?.saveState('unique', {error: new AuthError({error: 'access_denied'})});
       });
 
       try {
@@ -410,7 +425,7 @@ describe('Auth', () => {
   });
 
   describe('requestToken', () => {
-    let auth;
+    let auth: Auth;
     beforeEach(() => {
       sandbox.stub(Auth.prototype, '_redirectCurrentPage');
       sandbox.stub(Auth.prototype, 'getUser').resolves({id: 'APIuser'});
@@ -426,26 +441,28 @@ describe('Auth', () => {
         embeddedLogin: true
       });
 
-      auth._storage._tokenStorage = new MockedStorage();
-      auth.setAuthDialogService(() => {});
-      auth._initDeferred.resolve();
+      if (auth._storage != null) {
+        auth._storage._tokenStorage = new MockedStorage();
+      }
+      auth.setAuthDialogService(() => () => {});
+      auth._initDeferred?.resolve?.();
     });
 
-    afterEach(() => Promise.all([auth._storage.cleanStates(), auth._storage.wipeToken()]));
+    afterEach(() => Promise.all([auth._storage?.cleanStates(), auth._storage?.wipeToken()]));
 
     it('should resolve to access token if there is a valid one', async () => {
-      await auth._storage.saveToken({
+      await auth._storage?.saveToken({
         accessToken: 'token',
         expires: TokenValidator._epoch() + HOUR,
         scopes: ['0-0-0-0-0']
       });
       const token = await auth.requestToken();
-      token.should.be.equal('token');
+      'token'.should.be.equal(token);
     });
 
     it('should get token in iframe if there is no valid token', async () => {
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame').callsFake(() => {
-        auth._storage.saveToken({
+        auth._storage?.saveToken({
           accessToken: 'token',
           expires: TokenValidator._epoch() + HOUR,
           scopes: ['0-0-0-0-0']
@@ -457,13 +474,13 @@ describe('Auth', () => {
           '&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fhub&request_credentials=silent' +
           '&client_id=1-1-1-1-1&scope=0-0-0-0-0%20youtrack');
 
-      accessToken.should.be.equal('token');
+      'token'.should.be.equal(accessToken);
     });
 
     it('should show userchanged overlay if token was changed', async () => {
       auth.user = {id: 'initUser'};
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame').callsFake(() => {
-        auth._storage.saveToken({
+        auth._storage?.saveToken({
           accessToken: 'token',
           expires: TokenValidator._epoch() + HOUR,
           scopes: ['0-0-0-0-0']
@@ -480,7 +497,7 @@ describe('Auth', () => {
           '&state=unique&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fhub' +
           '&request_credentials=silent&client_id=1-1-1-1-1&scope=0-0-0-0-0%20youtrack');
       auth._showUserChangedDialog.should.have.been.called;
-      accessToken.should.be.equal('token');
+      'token'.should.be.equal(accessToken);
     });
 
     it('should reload page if user change was applied', () => {
@@ -491,7 +508,9 @@ describe('Auth', () => {
 
     it('should redirect current page if get token in iframe fails', async () => {
       auth.config.embeddedLogin = false;
-      auth._backgroundFlow._timeout = 100;
+      if (auth._backgroundFlow != null) {
+        auth._backgroundFlow._timeout = 100;
+      }
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame');
 
       try {
@@ -510,7 +529,9 @@ describe('Auth', () => {
     });
 
     it('should show login overlay if token refresh fails and window login enabled', async () => {
-      auth._backgroundFlow._timeout = 100;
+      if (auth._backgroundFlow != null) {
+        auth._backgroundFlow._timeout = 100;
+      }
       sandbox.stub(BackgroundFlow.prototype, '_redirectFrame');
       sandbox.stub(Auth.prototype, '_showAuthDialog');
 
@@ -526,7 +547,7 @@ describe('Auth', () => {
   });
 
   describe('requestUser', () => {
-    let auth;
+    let auth: Auth;
 
     beforeEach(() => {
       auth = new Auth({
@@ -563,12 +584,12 @@ describe('Auth', () => {
     });
 
     it('should wait for user saved during validation', async () => {
-      await auth._storage.saveToken({
+      await auth._storage?.saveToken({
         accessToken: 'token',
         expires: TokenValidator._epoch() + HOUR,
         scopes: ['0-0-0-0-0']
       });
-      await auth._tokenValidator.validateToken();
+      await auth._tokenValidator?.validateToken();
 
       const user = await auth.requestUser();
       Auth.prototype.getUser.should.have.been.calledOnce;
@@ -577,7 +598,7 @@ describe('Auth', () => {
   });
 
   describe('getUser', () => {
-    let auth;
+    let auth: Auth;
 
     beforeEach(() => {
       auth = new Auth({
@@ -637,7 +658,7 @@ describe('Auth', () => {
     });
 
     it('should trigger userChange', async () => {
-      sandbox.stub(Auth.prototype, 'getUser').returns({name: 'APIuser'});
+      sandbox.stub(Auth.prototype, 'getUser').returns(Promise.resolve({name: 'APIuser'}));
 
       await auth.login();
 
@@ -697,11 +718,12 @@ describe('Auth', () => {
           'request_credentials=required&client_id=1-1-1-1-1&scope=0-0-0-0-0%20youtrack'
         );
 
-      const storedToken = await auth._storage.getToken();
+      const storedToken = await auth._storage?.getToken();
       should.not.exist(storedToken);
 
-      const state = await auth._storage.getState('unique');
-      state.should.contain.all.keys({
+      const state = await auth._storage?.getState('unique');
+      should.exist(state);
+      state?.should.contain.all.keys({
         restoreLocation: window.location.href,
         scopes: ['0-0-0-0-0', 'youtrack']
       });
