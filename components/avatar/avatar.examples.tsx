@@ -18,13 +18,15 @@ export const avatar = () => {
   function Example() {
     return (
       <div>
-        {Object.keys(Size).map(size => (
-          <div className="avatar-demo" key={size}>
-            <Avatar size={Size[size]} url={avatarDataUri}/>
-            <Avatar size={Size[size]} url={avatarDataUri} round/>
-            <Avatar size={Size[size]}/>
-          </div>
-        ))}
+        {Object.entries(Size).map(([key, size]) => (typeof size === 'number'
+          ? (
+            <div className="avatar-demo" key={key}>
+              <Avatar size={size} url={avatarDataUri}/>
+              <Avatar size={size} url={avatarDataUri} round/>
+              <Avatar size={size}/>
+            </div>
+          )
+          : null))}
       </div>
     );
   }
