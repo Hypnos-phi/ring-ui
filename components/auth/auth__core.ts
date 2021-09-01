@@ -976,8 +976,9 @@ export default class Auth implements HTTPAuth {
    * @private
    */
   _redirectCurrentPage(url: string) {
-
-    window.location.href = fixUrl(url);
+    if (process.env.NODE_ENV !== 'test') {
+      window.location.href = fixUrl(url);
+    }
   }
 
   /**
