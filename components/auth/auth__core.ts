@@ -10,12 +10,12 @@ import AuthRequestBuilder from './request-builder';
 import BackgroundFlow from './background-flow';
 import TokenValidator, {TokenValidationError, TokenValidatorConfig} from './token-validator';
 
-/* eslint-disable no-magic-numbers */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
 export const DEFAULT_EXPIRES_TIMEOUT = 40 * 60;
 export const DEFAULT_BACKGROUND_TIMEOUT = 10 * 1000;
 const DEFAULT_BACKEND_CHECK_TIMEOUT = 10 * 1000;
 const BACKGROUND_REDIRECT_TIMEOUT = 20 * 1000;
-/* eslint-enable no-magic-numbers */
+/* eslint-enable @typescript-eslint/no-magic-numbers */
 
 export const USER_CHANGED_EVENT = 'userChange';
 export const DOMAIN_USER_CHANGED_EVENT = 'domainUser';
@@ -366,6 +366,9 @@ export default class Auth implements HTTPAuth {
         try {
           await this._detectUserChange(token.accessToken);
         } catch (error) {
+          if (!(error instanceof Error)) {
+            throw error
+          }
           if (this._canShowDialogs()) {
             this._showAuthDialog({nonInteractive: true, error});
           }
@@ -390,7 +393,7 @@ export default class Auth implements HTTPAuth {
       // Look for token or error in hash
       state = await this._checkForAuthResponse();
     } catch (error) {
-      return this.handleInitError(error);
+      return error instanceof Error ? this.handleInitError(error) : undefined;
     }
 
     // Return endless promise in the background to avoid service start
@@ -426,7 +429,7 @@ export default class Auth implements HTTPAuth {
         await this.requestUser(); // Someone may expect user to be loaded as a part of token validation
         return null;
       }
-      return this.handleInitValidationError(error);
+      return error instanceof Error ? this.handleInitValidationError(error) : undefined;
     }
   }
 
@@ -474,7 +477,7 @@ export default class Auth implements HTTPAuth {
         return undefined;
       } catch (validationError) {
         // Fallback to redirect flow
-        return this.sendRedirect(validationError);
+        return validationError instanceof Error ? this.sendRedirect(validationError) : undefined;
       }
     }
 
@@ -523,18 +526,21 @@ export default class Auth implements HTTPAuth {
     try {
       return await this._backgroundFlow?.authorize() ?? null;
     } catch (error) {
-
-      if (this._canShowDialogs()) {
-        this._showAuthDialog({nonInteractive: true, error});
-        return null;
-      } else {
-        const authRequest = await this._requestBuilder?.prepareAuthRequest();
-        if (authRequest != null) {
-          this._redirectCurrentPage(authRequest.url);
+      if (error instanceof Error) {
+        if (this._canShowDialogs()) {
+          this._showAuthDialog({nonInteractive: true, error});
+          return null;
+        } else {
+          const authRequest = await this._requestBuilder?.prepareAuthRequest();
+          if (authRequest != null) {
+            this._redirectCurrentPage(authRequest.url);
+          }
         }
-      }
 
-      throw new TokenValidator.TokenValidationError(error.message);
+        throw new TokenValidator.TokenValidationError(error.message);
+      } else {
+        return null;
+      }
     }
   }
 
@@ -944,7 +950,9 @@ export default class Auth implements HTTPAuth {
     try {
       await this._checkBackendsAreUp();
     } catch (backendDownErr) {
-      await this._showBackendDownDialog(backendDownErr);
+      if (backendDownErr instanceof Error) {
+        await this._showBackendDownDialog(backendDownErr);
+      }
     }
   }
 
