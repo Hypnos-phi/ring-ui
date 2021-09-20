@@ -18,7 +18,7 @@ import DatePopup from './date-popup';
 import {dateType, deprecatedPropType} from './consts';
 import styles from './date-picker.css';
 import formats from './formats';
-import DateInput from './date-input';
+import DateInput from './date-input'; 
 
 const PopupComponent = ({
   hidden,

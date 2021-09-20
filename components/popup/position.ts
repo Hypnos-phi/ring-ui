@@ -1,16 +1,19 @@
+import {CSSProperties} from 'react';
+
 import {
   getDocumentScrollLeft,
   getDocumentScrollTop,
   getRect,
   getWindowHeight,
-  isMounted
+  isMounted,
+  Rect
 } from '../global/dom';
 
 import {Dimension, Directions, MaxHeight, MinWidth} from './popup.consts';
 
 export {Dimension, Directions, MaxHeight, MinWidth};
 
-function getScrollingCoordinates(container) {
+function getScrollingCoordinates(container: Element) {
   if (container !== null) {
     return {
       top: container.scrollTop,
@@ -24,7 +27,13 @@ function getScrollingCoordinates(container) {
   };
 }
 
-function getPositionStyles(popup, anchorRect, anchorLeft, anchorTop, offset) {
+function getPositionStyles(
+  popup: Element,
+  anchorRect: Rect,
+  anchorLeft: number,
+  anchorTop: number,
+  offset: number
+) {
   const popupWidth = popup.clientWidth;
   const popupHeight = popup.clientHeight;
 
@@ -54,7 +63,33 @@ function getPositionStyles(popup, anchorRect, anchorLeft, anchorTop, offset) {
   };
 }
 
-function verticalOverflow(styles, scrollingCoordinates, attrs) {
+interface Position {
+  top: number,
+  left: number
+}
+
+type Styles = Position & CSSProperties
+
+export interface PositionAttrs {
+  popup: Element
+  anchor: Element
+  container: Element
+  directions: Directions[]
+  autoPositioning: boolean
+  sidePadding: number
+  top: number
+  left: number
+  offset: number
+  maxHeight: number
+  minWidth: number
+  autoCorrectTopOverflow: boolean
+}
+
+function verticalOverflow(
+  styles: Styles,
+  scrollingCoordinates: Position,
+  attrs: PositionAttrs
+) {
   const containerHeight = attrs.container !== null
     ? attrs.container.clientHeight
     : getWindowHeight();
@@ -70,7 +105,11 @@ function verticalOverflow(styles, scrollingCoordinates, attrs) {
   return topOverflow + bottomOverflow;
 }
 
-function horizontalOverflow(styles, scrollingCoordinates, attrs) {
+function horizontalOverflow(
+  styles: Styles,
+  scrollingCoordinates: Position,
+  attrs: PositionAttrs
+) {
   const containerWidth = attrs.container !== null ? attrs.container.clientWidth : window.innerWidth;
   const viewportMinY = scrollingCoordinates.left + attrs.sidePadding;
   const viewportMaxY = scrollingCoordinates.left + containerWidth - attrs.sidePadding;
@@ -101,9 +140,19 @@ const defaultcontainerRect = {
   left: 0
 };
 
+interface TopOffScreenParams {
+  sidePadding: number
+  styles: Styles
+  anchorRect: Rect
+  maxHeight: number
+  popupScrollHeight: number
+  direction: Directions
+  scroll: Position
+}
+
 function handleTopOffScreen({
   sidePadding, styles, anchorRect, maxHeight, popupScrollHeight, direction, scroll
-}) {
+}: TopOffScreenParams) {
   const BORDER_COMPENSATION = 1;
   const {TOP_LEFT, TOP_RIGHT, TOP_CENTER, RIGHT_TOP, LEFT_TOP} = Directions;
 
@@ -128,7 +177,11 @@ function handleTopOffScreen({
 }
 
 
-export function maxHeightForDirection(direction, anchorNode, containerNode) {
+export function maxHeightForDirection(
+  direction: Directions,
+  anchorNode: Element,
+  containerNode: Element
+) {
   const container = containerNode || document.documentElement;
   const domRect = anchorNode.getBoundingClientRect();
   const containerRect = container.getBoundingClientRect();
@@ -163,7 +216,7 @@ export function maxHeightForDirection(direction, anchorNode, containerNode) {
   }
 }
 
-export default function position(attrs) {
+export default function position(attrs: PositionAttrs) {
   const {
     popup,
     anchor,
@@ -216,7 +269,7 @@ export default function position(attrs) {
     }
 
     // because of the anchor negative margin top and left also may become negative
-    ['left', 'top'].forEach(key => {
+    (['left', 'top'] as const).forEach(key => {
       if (styles[key] < 0) {
         styles[key] = 0;
       }

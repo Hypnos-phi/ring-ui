@@ -9,8 +9,8 @@ import {weekdays} from './consts';
 import styles from './date-picker.css';
 
 export default function Weekdays() {
-  const days = Object.keys(weekdays).
-    map(key => startOfDay(setDay(new Date(), weekdays[key])));
+  const days = Object.values(weekdays).
+    map(value => startOfDay(setDay(new Date(), value)));
 
   return (
     <div className={styles.weekdays}>
